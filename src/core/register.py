@@ -20,6 +20,7 @@ from curl_cffi import requests as cffi_requests
 from .anyauto.register_flow import AnyAutoRegistrationEngine
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
+from .timezone_utils import utcnow_naive
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
 from ..database.session import get_db
@@ -1434,7 +1435,7 @@ class RegistrationEngine:
         login_otp_ok = self._verify_email_otp_with_retry(
             stage_label="登录验证码",
             max_attempts=1,
-            fetch_timeout=120,
+            fetch_timeout=180,
             attempted_codes=login_otp_tried_codes,
         )
         if not login_otp_ok:
@@ -1444,7 +1445,7 @@ class RegistrationEngine:
                 login_otp_ok = self._verify_email_otp_with_retry(
                     stage_label="登录验证码(原地重发)",
                     max_attempts=2,
-                    fetch_timeout=120,
+                    fetch_timeout=180,
                     attempted_codes=login_otp_tried_codes,
                 )
 
@@ -1459,7 +1460,7 @@ class RegistrationEngine:
             login_otp_ok = self._verify_email_otp_with_retry(
                 stage_label="登录验证码(重发)",
                 max_attempts=3,
-                fetch_timeout=120,
+                fetch_timeout=180,
                 attempted_codes=login_otp_tried_codes,
             )
             if not login_otp_ok:
@@ -1620,7 +1621,7 @@ class RegistrationEngine:
             login_otp_ok = self._verify_email_otp_with_retry(
                 stage_label="登录验证码(重发)",
                 max_attempts=3,
-                fetch_timeout=120,
+                fetch_timeout=180,
                 attempted_codes=login_otp_tried_codes,
             )
         if not login_otp_ok:
@@ -2192,7 +2193,7 @@ class RegistrationEngine:
             self._log(f"正在等待邮箱 {mailbox_email} 的验证码...")
 
             email_id = self.email_info.get("service_id") if self.email_info else None
-            fetch_timeout = int(timeout) if timeout and int(timeout) > 0 else 120
+            fetch_timeout = int(timeout) if timeout and int(timeout) > 0 else 180
             code = self.email_service.get_verification_code(
                 email=mailbox_email,
                 email_id=email_id,
@@ -3016,6 +3017,8 @@ class RegistrationEngine:
             "invalid_request_error",
             "http 400",
             "registration failed",
+            "跟随重定向链失败",
+            "redirect",
         )
         return any(marker in error_text for marker in retryable_markers)
 
@@ -3063,6 +3066,23 @@ class RegistrationEngine:
             # 获取默认 client_id
             settings = get_settings()
 
+            # 从 access_token 提取过期时间
+            expires_at = None
+            if result.access_token:
+                try:
+                    import base64
+                    parts = result.access_token.split('.')
+                    if len(parts) >= 2:
+                        payload = parts[1]
+                        padding = '=' * ((4 - len(payload) % 4) % 4)
+                        decoded = base64.urlsafe_b64decode(payload + padding)
+                        claims = json.loads(decoded)
+                        exp = claims.get('exp', 0)
+                        if exp:
+                            expires_at = datetime.fromtimestamp(exp)
+                except Exception as e:
+                    self._log(f"提取过期时间失败: {e}", "warning")
+
             with get_db() as db:
                 # 保存账户信息
                 account = crud.create_account(
@@ -3080,6 +3100,7 @@ class RegistrationEngine:
                     refresh_token=result.refresh_token,
                     id_token=result.id_token,
                     proxy_used=self.proxy_url,
+                    expires_at=expires_at,
                     extra_data=result.metadata,
                     source=result.source,
                     account_label=account_label,
@@ -3087,6 +3108,29 @@ class RegistrationEngine:
                 )
 
                 self._log(f"账户已存进数据库，落袋为安，ID: {account.id}")
+
+                # 自动上传到 CPA（如果启用）
+                try:
+                    from ..upload.cpa_upload import generate_token_json, upload_to_cpa
+
+                    if settings.cpa_enabled and settings.cpa_api_url:
+                        self._log("正在自动上传到 CPA...")
+                        token_json = generate_token_json(account)
+                        success, message = upload_to_cpa(
+                            token_data=token_json,
+                            api_url=settings.cpa_api_url,
+                            api_token=settings.cpa_api_token.get_secret_value() if settings.cpa_api_token else None
+                        )
+                        if success:
+                            self._log(f"CPA 上传成功: {message}")
+                            account.cpa_uploaded = True
+                            account.cpa_uploaded_at = utcnow_naive()
+                            db.commit()
+                        else:
+                            self._log(f"CPA 上传失败: {message}", "warning")
+                except Exception as e:
+                    self._log(f"CPA 上传异常: {e}", "warning")
+
                 return True
 
         except Exception as e:

@@ -1510,7 +1510,7 @@ class OAuthClient:
             skymail_client._used_codes = set()
 
         tried_codes = set(getattr(skymail_client, "_used_codes", set()))
-        otp_deadline = time.time() + 60
+        otp_deadline = time.time() + 180
         otp_sent_at = time.time()
 
         def validate_otp(code):

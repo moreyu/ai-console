@@ -15,6 +15,7 @@ from ...database.session import get_db
 from ...database.models import Account
 from ...config.settings import get_settings
 from ..timezone_utils import utcnow_naive
+from ..id_token_utils.id_token_generator import ensure_id_token
 
 logger = logging.getLogger(__name__)
 
@@ -100,13 +101,19 @@ def generate_token_json(account: Account) -> dict:
     Returns:
         CPA 格式的 Token 字典
     """
+    account_id_value = account.account_id or ""
+    # 自动生成 id_token（如果缺失）
+    id_token_value = ensure_id_token(account)
+
     return {
         "type": "codex",
         "email": account.email,
         "expired": account.expires_at.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.expires_at else "",
-        "id_token": account.id_token or "",
-        "account_id": account.account_id or "",
+        "id_token": id_token_value,
+        "account_id": account_id_value,
+        "chatgpt_account_id": account_id_value,  # 兼容 Cliproxy
         "access_token": account.access_token or "",
+        "session_token": account.session_token or "",  # 添加 session_token
         "last_refresh": account.last_refresh.strftime("%Y-%m-%dT%H:%M:%S+08:00") if account.last_refresh else "",
         "refresh_token": account.refresh_token or "",
     }
